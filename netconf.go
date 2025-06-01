@@ -5,8 +5,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nemith/netconf"
@@ -28,7 +28,7 @@ type Notification struct {
 type SROSLogGenericEvent struct {
 	XMLName        xml.Name `xml:"sros-log-generic-event"`
 	XMLNS          string   `xml:"xmlns,attr"` // This captures the namespace URL
-	SequenceNumber int      `xml:"sequence-number"`
+	SequenceNumber uint     `xml:"sequence-number"`
 	Severity       string   `xml:"severity"`
 	Application    string   `xml:"application"`
 	EventID        int      `xml:"event-id"`
@@ -46,27 +46,20 @@ type EventParams struct {
 	Message string   `xml:"message"` // Note: This 'message' field is nested within event-params
 }
 
-func (n Notification) ToDebugFileFormat() string {
+func (n Notification) ToLogMsg() *LogMsg {
 	t, err := time.Parse(time.RFC3339Nano, n.EventTime)
 	if err != nil {
 		panic(err)
 	}
-	header := fmt.Sprintf("%d %s %s: %s #%d %v %v",
-		n.SROSLogGenericEvent.SequenceNumber,
-		t.Format("2006/01/02 15:04:05.000 MST"),
-		strings.ToUpper(n.SROSLogGenericEvent.Severity),
-		strings.ToUpper(n.SROSLogGenericEvent.Application),
-		n.SROSLogGenericEvent.EventID,
-		n.SROSLogGenericEvent.RouterName,
-		n.SROSLogGenericEvent.Subject,
-	)
-	return header + "\n\"" + n.SROSLogGenericEvent.Message + "\"\n"
-
+	return &LogMsg{
+		ID:        n.SROSLogGenericEvent.SequenceNumber,
+		Timestamp: t,
+		Msg:       n.SROSLogGenericEvent.Message,
+	}
 }
 
-func (cli *CLI) getNetConfEvts(ctx context.Context, wg *sync.WaitGroup, outputch chan *Notification) {
+func (cli *CLI) getNetConfEvts(ctx context.Context, wg *sync.WaitGroup, rlist *[]*LogMsg) {
 	defer wg.Done()
-	defer close(outputch)
 	config := &ssh.ClientConfig{
 		User: cli.Netconf.User,
 		Auth: []ssh.AuthMethod{
@@ -79,7 +72,19 @@ func (cli *CLI) getNetConfEvts(ctx context.Context, wg *sync.WaitGroup, outputch
 		panic(err)
 	}
 	defer transport.Close()
-	count := 0
+	count := new(int64)
+	*count = 0
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				time.Sleep(time.Second)
+				fmt.Printf("\rRcvd: %d", atomic.LoadInt64(count))
+			}
+		}
+	}()
 	nh := func(msg netconf.Notification) {
 		evt := new(Notification)
 		bodystr := "<notification>" + string(msg.Body) + "</notification>"
@@ -87,9 +92,9 @@ func (cli *CLI) getNetConfEvts(ctx context.Context, wg *sync.WaitGroup, outputch
 		if err != nil {
 			log.Print(err)
 		}
-		outputch <- evt
-		count++
-		fmt.Printf("\rGot %d", count)
+		// outputch <- evt.ToLogMsg()
+		*rlist = append(*rlist, evt.ToLogMsg())
+		atomic.AddInt64(count, 1)
 	}
 
 	session, err := netconf.Open(transport, netconf.WithNotificationHandler(nh))

@@ -1,31 +1,34 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"net/netip"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
+// logMsg is debug msg, one msg is a single debug msg, one IPsec debug event might contain multiple msgs, like a IKE_AUTH packet debug output might contain two msgs
 type LogMsg struct {
 	ID                     uint
 	Timestamp              time.Time
 	Msg                    string
-	RemoteIP               netip.Addr
-	RemotePort             uint
-	CountiuationOfPrevious bool
-	ISPI                   string
-	IsCertDump             bool
+	CountiuationOfPrevious bool //if true, means this msg is a continuation of previous msg, e.g. a fragment
 }
 
 // SplitLines split input into a slice of line, while keeping "\n", so an empty new line in the input will be an item the result slice
 func SplitLines(input string) []string {
-	input = strings.Replace(input, "\r\n", "\n", -1)
-	var Sep rune = 0
-	news := strings.Replace(input, "\n", "\n"+string(Sep), -1)
-	return strings.FieldsFunc(news, func(c rune) bool { return c == rune(0) })
+	buf := bytes.NewBufferString(input)
+	s := bufio.NewScanner(buf)
+	r := []string{}
+	for s.Scan() {
+		r = append(r, s.Text())
+	}
+	return r
 }
 
 type msgState int
@@ -33,32 +36,27 @@ type msgState int
 const (
 	lookingForMsgStart msgState = iota
 	msgBegin
+	lookingForMsgEnd
 )
 
-type eventState int
-
-const (
-	lookingForEventStart eventState = iota
-	eventBegin
-)
-
-type parseMachine struct {
-	mstate   msgState
-	estate   eventState
-	msgList  []*LogMsg
-	curMSG   *LogMsg
-	idiEPMap map[string]netip.AddrPort
+// stringScanner scan input from src (e.g. a file), divide strings into LogMsg, send out via output,
+// implemented via a FSM
+type stringScanner struct {
+	src    *bufio.Scanner
+	state  msgState
+	curMSG *LogMsg
+	output chan *LogMsg
 }
 
-func newParseMachine() *parseMachine {
-	return &parseMachine{
-		idiEPMap: make(map[string]netip.AddrPort),
+func newStringScanner(input io.Reader, out chan *LogMsg) *stringScanner {
+	return &stringScanner{
+		src:    bufio.NewScanner(input),
+		output: out,
 	}
 }
 
-func (m *parseMachine) lookingForMsgStartHandle(curlineIndex int, lineList []string) error {
-	curline := lineList[curlineIndex]
-	if strings.Contains(curline, `MINOR: DEBUG #2001`) {
+func (m *stringScanner) lookingForMsgStartHandle(curline string) error {
+	if strings.Contains(curline, `DEBUG #2001`) {
 		flist := strings.Fields(curline)
 		id, err := strconv.Atoi(flist[0])
 		if err != nil {
@@ -72,7 +70,7 @@ func (m *parseMachine) lookingForMsgStartHandle(curlineIndex int, lineList []str
 			ID:        uint(id),
 			Timestamp: t,
 		}
-		m.mstate = msgBegin
+		m.state = msgBegin
 	}
 	return nil
 }
@@ -107,107 +105,64 @@ func addrPortToSRFmt(ap netip.AddrPort) string {
 	return fmt.Sprintf("%v[%d]", ap.Addr().String(), ap.Port())
 }
 
-func (m *parseMachine) msgBeginHandle(curlineIndex int, lineList []string) error {
-	m.curMSG.Msg += lineList[curlineIndex]
-	if lineList[curlineIndex] == "[...IKE message continuation]\n" || strings.HasSuffix(lineList[curlineIndex], "Cert cont:\n") {
-		m.curMSG.CountiuationOfPrevious = true
-	}
-	if lineList[curlineIndex] == "Certificate:\n" {
-		m.curMSG.IsCertDump = true
-	}
-	//try locate idi and remote ep
-	if lineList[curlineIndex] == "IKEv2 Identification - initiator payload\n" {
+func (m *stringScanner) msgBeginHandle(curline string) error {
+	m.curMSG.Msg += curline
 
-		dataLine := lineList[curlineIndex+4]
-		flist := strings.FieldsFunc(dataLine, func(c rune) bool { return c == ':' })
-		idi := strings.TrimSpace(flist[1])
-		for i := curlineIndex; i >= 0; i-- {
-			if strings.HasPrefix(lineList[i], "Source: ") {
-				ap, err := parseSRAddrPort(lineList[i][7:])
-				if err != nil {
-					return fmt.Errorf("failed to parse %v, %w", lineList[i], err)
-				}
-				m.idiEPMap[idi] = *ap
-				break
-			}
-		}
-
-	}
-	if strings.HasSuffix(lineList[curlineIndex], "\"\n") && lineList[curlineIndex+1] == "\n" {
-
-		m.msgList = append(m.msgList, m.curMSG)
-		m.mstate = lookingForMsgStart
-
+	if strings.HasSuffix(curline, "\"\n") {
+		m.state = lookingForMsgEnd
 	}
 	return nil
 
 }
 
-func (m *parseMachine) feedLine(curline int, lineList []string) error {
+func (m *stringScanner) lookingForMsgEndHandle(line string) error {
+	if line == "\n" {
+		m.state = lookingForMsgStart
+		m.output <- m.curMSG
+		return nil
+	}
+	m.state = msgBegin
+	return m.msgBeginHandle(line)
+}
+
+func (m *stringScanner) feedLine(line string) error {
 	var err error
-	switch m.mstate {
+	switch m.state {
 	case lookingForMsgStart:
-		err = m.lookingForMsgStartHandle(curline, lineList)
+		err = m.lookingForMsgStartHandle(line)
+		if err != nil {
+			return err
+		}
+	case lookingForMsgEnd:
+		err = m.lookingForMsgEndHandle(line)
 		if err != nil {
 			return err
 		}
 	case msgBegin:
-		err = m.msgBeginHandle(curline, lineList)
+		err = m.msgBeginHandle(line)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
-func (m *parseMachine) getMatchedIdi(idiPattern string) ([]string, error) {
-	r := []string{}
-	re, err := regexp.Compile(idiPattern)
-	if err != nil {
-		return nil, err
-	}
 
-	for idi := range m.idiEPMap {
-		if re.FindString(idi) != "" {
-			r = append(r, idi)
-		}
-	}
-	return r, nil
-}
-
-func (m *parseMachine) getEPsOutput(idiPattern string) (string, error) {
-	idiList, err := m.getMatchedIdi(idiPattern)
-	if err != nil {
-		return "", err
-	}
-	targetIDiAPMap := make(map[string]netip.AddrPort)
-	r := fmt.Sprintf("%d matched out of total %d\n", len(idiList), len(m.idiEPMap))
-
-	for _, idi := range idiList {
-		targetIDiAPMap[idi] = m.idiEPMap[idi]
-		r += fmt.Sprintf("IDi '%v' ==>  %v\n", idi, m.idiEPMap[idi])
-
-	}
-
-	return r, nil
-}
-
-func (m *parseMachine) Parse(input string) error {
-	lineList := SplitLines(input)
-	const minimalLines = 2
-	if len(lineList) < minimalLines {
-		return fmt.Errorf("input is less than %d lines", minimalLines)
-	}
+func (m *stringScanner) Parse(ctx context.Context) error {
+	defer close(m.output)
 	var err error
-	for i := 0; i < len(lineList)-1; i++ {
-		err = m.feedLine(i, lineList)
+	for m.src.Scan() {
+		err = m.feedLine(m.src.Text() + "\n")
 		if err != nil {
-			return fmt.Errorf("failed to handle line %d and %d, %w", i+1, i+2, err)
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return m.src.Err()
+		default:
 		}
 	}
-	fmt.Printf("parsed %d lines\n", len(lineList))
-	//check unfinished state, e.g last unfinished msg
 
-	return nil
+	return m.src.Err()
 }
 
 // convert subject DN in ikev2 pkt debug output ('Country=US, StateOrProv=CA, Locality=Sunnyvale, OrgName=Nokia, OrgUnitName=NI, CommonName=SeGW-2, Email=segw2@gmail.com')
@@ -263,59 +218,4 @@ func ikeDNToCertDN(ikedn string) (string, error) {
 	}
 	r = strings.TrimSpace(r)
 	return r[:len(r)-1], nil
-}
-
-func (m *parseMachine) printIDiMatchedMsgList(idiPattern string) error {
-	idiList, err := m.getMatchedIdi(idiPattern)
-	if err != nil {
-		return err
-	}
-	targetIDiAPMap := make(map[string]netip.AddrPort)
-	for _, idi := range idiList {
-		targetIDiAPMap[idi] = m.idiEPMap[idi]
-	}
-	print := false
-	var n int
-	for i := 0; i < len(m.msgList); {
-		print = false
-
-		for idi, ep := range targetIDiAPMap {
-			if strings.Contains(m.msgList[i].Msg, idi) {
-				print = true
-				break
-			}
-			if strings.Contains(m.msgList[i].Msg, addrPortToSRFmt(ep)) {
-				print = true
-				break
-			}
-			certdn, err := ikeDNToCertDN(idi)
-			if err == nil {
-				if strings.Contains(m.msgList[i].Msg, certdn) {
-					print = true
-					break
-				}
-			}
-
-		}
-		if print {
-			fmt.Printf("%d %v\n%v\n---------\n", m.msgList[i].ID, m.msgList[i].Timestamp, m.msgList[i].Msg)
-			n = 1
-			for {
-				if i+n >= len(m.msgList) {
-					i += n - 1
-					break
-				}
-				if !m.msgList[i+n].CountiuationOfPrevious {
-					i += n - 1
-					break
-				}
-				fmt.Printf("%d %v\n%v\n---------\n", m.msgList[i+n].ID, m.msgList[i+n].Timestamp, m.msgList[i+n].Msg)
-				n += 1
-			}
-
-		}
-		i += 1
-
-	}
-	return nil
 }
