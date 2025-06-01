@@ -21,11 +21,10 @@ type CLI struct {
 		InputFile string `short:"i" required:"" usage:"SROS debug IPsec output file" noun:"1"`
 	} `action:"RunFile" usage:"read SROS IPsec debug from file"`
 	Netconf struct {
-		Router     netip.AddrPort `noun:"1" short:"r" usage:"router's address and netconf port, e.g. 192.168.1.1:830"`
-		User       string         `short:"u" usage:"netconf username"`
-		Passwd     string         `short:"p" usage:"netconf passwrod"`
-		Stream     string         `noun:"2" short:"s" usage:"netconf notification stream name"`
-		OutputFile string         `short:"o" usage:"write debug events to the specified file"`
+		Router netip.AddrPort `noun:"1" short:"r" usage:"router's address and netconf port, e.g. 192.168.1.1:830"`
+		User   string         `short:"u" usage:"netconf username"`
+		Passwd string         `short:"p" usage:"netconf passwrod"`
+		Stream string         `noun:"2" short:"s" usage:"netconf notification stream name"`
 	} `action:"RunNetconf" usage:"receive SROS IPsec debug via netconf notification"`
 }
 
