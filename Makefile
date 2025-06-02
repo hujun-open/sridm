@@ -19,12 +19,14 @@ all: windows linux ## Compile for both Windows and Linux
 windows: ## Compile for Windows
 	@echo "Compiling for Windows ..."
 	@mkdir -p $(BUILD_DIR)
+	@rm $(BUILD_DIR)/$(APP_NAME).exe
 	GOOS=windows GOARCH=amd64 go build -o $(BUILD_DIR)/$(APP_NAME).exe $(MAIN_DIR)
 	@echo "Windows executable built: $(BUILD_DIR)/$(APP_NAME).exe"
 
 linux: ## Compile for Linux 
 	@echo "Compiling for Linux ..."
 	@mkdir -p $(BUILD_DIR)
+	@rm $(BUILD_DIR)/$(APP_NAME)
 	GOOS=linux GOARCH=amd64 go build -o $(BUILD_DIR)/$(APP_NAME) $(MAIN_DIR)
 	@echo "Linux binary built: $(BUILD_DIR)/$(APP_NAME)"
 

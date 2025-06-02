@@ -57,6 +57,7 @@ func (cli *CLI) RunNetconf(cmd *cobra.Command, args []string) {
 	if cli.ShowMsg {
 		em.printMatchedMsgs()
 	}
+
 }
 
 func (cli *CLI) RunFile(cmd *cobra.Command, args []string) {

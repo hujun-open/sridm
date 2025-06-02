@@ -16,7 +16,7 @@ type msgAnalyzer struct {
 	Input      chan *LogMsg
 	IdiPattern string
 	idiRegexp  *regexp.Regexp
-	idiEPMap   map[string]netip.AddrPort
+	idiEPMap   map[string]map[string]interface{} //key is idi, val is a map whose key is marshalled netip.AddrPort
 	wg         *sync.WaitGroup
 	msgList    []*LogMsg
 }
@@ -27,7 +27,7 @@ func newMsgAnalyzer(idiPattern string) (*msgAnalyzer, error) {
 	r := &msgAnalyzer{
 		Input:      make(chan *LogMsg, inputChanDepth),
 		IdiPattern: idiPattern,
-		idiEPMap:   make(map[string]netip.AddrPort),
+		idiEPMap:   make(map[string]map[string]interface{}),
 		wg:         new(sync.WaitGroup),
 		msgList:    []*LogMsg{},
 	}
@@ -66,7 +66,14 @@ func (em *msgAnalyzer) Recv() {
 								break L1
 
 							}
-							em.idiEPMap[idi] = *ap
+							if _, ok := em.idiEPMap[idi]; ok {
+								em.idiEPMap[idi][ap.String()] = true
+							} else {
+								em.idiEPMap[idi] = map[string]interface{}{
+									ap.String(): true,
+								}
+							}
+
 							break L1
 						}
 					}
@@ -107,19 +114,21 @@ func (em *msgAnalyzer) GetMatachedMsg() []*LogMsg {
 }
 
 func (em *msgAnalyzer) matchMsg(msg *LogMsg, matchedIDi []string) bool {
-	targetIDiAPMap := make(map[string]netip.AddrPort)
+	targetIDiAPMap := make(map[string]map[string]interface{})
 	for _, idi := range matchedIDi {
 		targetIDiAPMap[idi] = em.idiEPMap[idi]
 	}
 	matched := false
-	for idi, ep := range targetIDiAPMap {
+	for idi, epDict := range targetIDiAPMap {
 		if strings.Contains(msg.Msg, idi) {
 			matched = true
 			break
 		}
-		if strings.Contains(msg.Msg, addrPortToSRFmt(ep)) {
-			matched = true
-			break
+		for ep := range epDict {
+			if strings.Contains(msg.Msg, addrPortToSRFmt(netip.MustParseAddrPort(ep))) {
+				matched = true
+				break
+			}
 		}
 		certdn, err := ikeDNToCertDN(idi)
 		if err == nil {
@@ -139,9 +148,13 @@ func (em *msgAnalyzer) Wait() {
 
 func (em *msgAnalyzer) getEPsOutput() string {
 	idiList := em.GetMatchedIdi()
-	r := fmt.Sprintf("%d matched out of total %d\n", len(idiList), len(em.idiEPMap))
+	r := fmt.Sprintf("%d matched out of total %d IDi\n", len(idiList), len(em.idiEPMap))
 	for _, idi := range idiList {
-		r += fmt.Sprintf("IDi '%v' ==>  %v\n", idi, em.idiEPMap[idi])
+		epList := []string{}
+		for ep := range em.idiEPMap[idi] {
+			epList = append(epList, ep)
+		}
+		r += fmt.Sprintf("IDi '%v' ==>  %v\n", idi, strings.Join(epList, ","))
 
 	}
 	return r
